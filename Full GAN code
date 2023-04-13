@@ -1,0 +1,184 @@
+import os
+import random
+import json
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Dense, LSTM, Embedding, TimeDistributed, Concatenate
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.preprocessing.text import Tokenizer
+
+
+data_dir = '/content/Example2_filtered'
+
+np.random.seed(1234)
+
+# Section 1 - setting the constants
+max_text_sequence_length = 200
+max_words = 1000
+oov_token = "<OOV>"
+latent_dim = 100
+text_encoding_dim = 128
+epochs = 200
+batch_size = 16
+
+# Section 2
+def split_data(data_dir, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1):
+    all_folders = sorted([folder for folder in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, folder)) and folder.startswith("match")])
+    
+    data_size = len(all_folders)
+    indices = list(range(data_size))
+    
+    train_split = int(np.floor(train_ratio * data_size))
+    val_split = int(np.floor((train_ratio + val_ratio) * data_size))
+    
+    np.random.shuffle(indices)
+    
+    train_indices, val_indices, test_indices = indices[:train_split], indices[train_split:val_split], indices[val_split:]
+    
+    train_folders = [all_folders[i] for i in train_indices]
+    val_folders = [all_folders[i] for i in val_indices]
+    test_folders = [all_folders[i] for i in test_indices]
+
+    return train_folders, val_folders, test_folders
+
+def load_data(data_dir, folders):
+    text_data = []
+    keypoints_data = []
+
+    for folder in folders:
+        subtitle_path = os.path.join(data_dir, folder, f"subtitle{folder[5:]}.txt")
+        with open(subtitle_path, "r") as f:
+            text_line = f.readline().strip()
+            text_data.append(text_line)
+
+        keypoints = []
+        for root, _, files in os.walk(os.path.join(data_dir, folder)):
+            for file in files:
+                if file.endswith("_keypoints.json"):
+                    keypoints_path = os.path.join(root, file)
+
+                    with open(keypoints_path, "r") as f:
+                        keypoints_json = json.load(f)
+                        if not keypoints_json["people"]:
+                            continue
+                        keypoints.extend(keypoints_json["people"])
+        keypoints_data.append(keypoints)
+
+    return text_data, keypoints_data
+
+train_folders, val_folders, test_folders = split_data(data_dir)
+
+train_text_data, train_keypoints_data = load_data(data_dir, train_folders)
+val_text_data, val_keypoints_data = load_data(data_dir, val_folders)
+test_text_data, test_keypoints_data = load_data(data_dir, test_folders)
+
+# Section 3 - tokenizer, converting to list, padding
+tokenizer = Tokenizer(num_words=max_words, oov_token=oov_token)
+tokenizer.fit_on_texts(train_text_data)
+train_text_data = pad_sequences(tokenizer.texts_to_sequences(train_text_data), maxlen=max_text_sequence_length)
+val_text_data = pad_sequences(tokenizer.texts_to_sequences(val_text_data), maxlen=max_text_sequence_length)
+test_text_data = pad_sequences(tokenizer.texts_to_sequences(test_text_data), maxlen=max_text_sequence_length)
+
+def convert_dicts_to_lists(keypoints_data):
+    converted_data = []
+    for keypoints_dicts in keypoints_data:
+        keypoints_list = []
+        for keypoints_dict in keypoints_dicts:
+            if "pose_keypoints_2d" in keypoints_dict:
+                keypoints_list.extend(keypoints_dict["pose_keypoints_2d"])
+            if "face_keypoints_2d" in keypoints_dict:
+                keypoints_list.extend(keypoints_dict["face_keypoints_2d"])
+            if "hand_left_keypoints_2d" in keypoints_dict:
+                keypoints_list.extend(keypoints_dict["hand_left_keypoints_2d"])
+            if "hand_right_keypoints_2d" in keypoints_dict:
+                keypoints_list.extend(keypoints_dict["hand_right_keypoints_2d"])
+        converted_data.append(keypoints_list)
+    return converted_data
+
+train_keypoints_data = pad_sequences(convert_dicts_to_lists(train_keypoints_data), dtype='float32')
+val_keypoints_data = pad_sequences(convert_dicts_to_lists(val_keypoints_data), dtype='float32')
+test_keypoints_data = pad_sequences(convert_dicts_to_lists(test_keypoints_data), dtype='float32')
+
+keypoints_output_dim = train_keypoints_data.shape[1]
+
+# Section 4
+def create_text_encoder(input_shape, encoding_size, tokenizer):
+    vocab_size = len(tokenizer.word_index) + 1
+    model = tf.keras.models.Sequential([
+        Input(shape=input_shape, dtype=tf.int32),
+        Embedding(vocab_size, encoding_size),
+        LSTM(128)
+    ])
+    return model
+
+# Section 5 - GAN
+def build_generator(latent_dim, text_encoding_dim, keypoints_output_dim):
+    z = Input(shape=(latent_dim,))
+    text_input = Input(shape=(text_encoding_dim,))
+    x = Concatenate()([z, text_input])
+    x = Dense(256, activation='relu')(x)
+    x = Dense(512, activation='relu')(x)
+    keypoints = Dense(keypoints_output_dim, activation='tanh')(x)
+    return Model(inputs=[z, text_input], outputs=keypoints)
+
+def build_discriminator(keypoints_output_dim, text_encoding_dim):
+    keypoints_input = Input(shape=(keypoints_output_dim,))
+    text_input = Input(shape=(text_encoding_dim,))
+    x = Concatenate()([keypoints_input, text_input])
+    x = Dense(256, activation='relu')(x)
+    x = Dense(128, activation='relu')(x)
+    validity = Dense(1, activation='sigmoid')(x)
+    return Model(inputs=[keypoints_input, text_input], outputs=validity)
+
+def build_gan(generator, discriminator):
+    discriminator.trainable = False
+    z = Input(shape=(latent_dim,))
+    text_input = Input(shape=(text_encoding_dim,))
+    keypoints = generator([z, text_input])
+    validity = discriminator([keypoints, text_input])
+    return Model(inputs=[z, text_input], outputs=validity)
+
+text_encoder = create_text_encoder(input_shape=(max_text_sequence_length,), encoding_size=text_encoding_dim, tokenizer=tokenizer)
+generator = build_generator(latent_dim, text_encoding_dim, keypoints_output_dim)
+discriminator = build_discriminator(keypoints_output_dim, text_encoding_dim)
+gan = build_gan(generator, discriminator)
+
+discriminator.compile(optimizer=Adam(0.0002, 0.5), loss='binary_crossentropy', metrics=['accuracy'])
+gan.compile(optimizer=Adam(0.0002, 0.5), loss='binary_crossentropy')
+
+
+g_losses = []
+d_losses = []
+acc = []
+
+for epoch in range(epochs):
+    
+    idx = np.random.randint(0, train_keypoints_data.shape[0], batch_size)
+    real_keypoints = train_keypoints_data[idx]
+
+    text_idx = np.random.randint(0, train_text_data.shape[0], batch_size)
+    text_data = train_text_data[text_idx]
+    text_encodings = text_encoder.predict(text_data)
+
+    z_noise = np.random.normal(0, 1, (batch_size, latent_dim))
+    fake_keypoints = generator.predict([z_noise, text_encodings])
+
+    real_y = np.ones((batch_size, 1))
+    fake_y = np.zeros((batch_size, 1))
+
+    d_loss_real = discriminator.train_on_batch([real_keypoints, text_encodings], real_y)
+    d_loss_fake = discriminator.train_on_batch([fake_keypoints, text_encodings], fake_y)
+    d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
+
+ 
+    valid_y = np.ones((batch_size, 1))
+    g_loss = gan.train_on_batch([z_noise, text_encodings], valid_y)
+
+    g_losses.append(g_loss)
+    d_losses.append(d_loss[0])
+    accuracy = (100 * d_loss[1])
+    acc.append(accuracy)
+
+    print(f"{epoch} [D loss: {d_loss[0]}, acc.: {100 * d_loss[1]}] [G loss: {g_loss}]")
