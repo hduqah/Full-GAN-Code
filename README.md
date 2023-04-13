@@ -21,14 +21,16 @@ The dataset should be placed in a folder named 'Example2_filtered' with the foll
 Example2_filtered/
     match1/
         subtitle1.txt
-        1_keypoints.json
-        2_keypoints.json
-        ...
+        keypoints1/
+		1_keypoints.json
+		2_keypoints.json
+       		...
     match2/
         subtitle2.txt
-        1_keypoints.json
-        2_keypoints.json
-        ...
+   	keypoints1/
+		1_keypoints.json
+		2_keypoints.json
+       		...
     ...
 	
 Each folder represents a match, containing a subtitle file and several keypoints files. The subtitle files should contain text in a single line. The keypoints files should be in JSON format, containing keypoints information for different body parts.
